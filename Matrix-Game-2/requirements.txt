@@ -18,6 +18,8 @@ einops
 av
 safetensors
 opencv-python
+PySide6>=6.6
+requests>=2.31.0
 git+https://github.com/openai/CLIP.git
 open_clip_torch
 starlette

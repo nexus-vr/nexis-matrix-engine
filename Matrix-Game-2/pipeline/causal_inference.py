@@ -476,7 +476,10 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         return_latents: bool = False,
         output_folder = None,
         name = None,
-        mode = 'universal'
+        mode = 'universal',
+        on_frame: Optional[callable] = None,
+        action_provider: Optional[callable] = None,
+        interactive: bool = True,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -583,7 +586,14 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             noisy_input = noise[
                 :, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
-            current_actions = get_current_action(mode=mode)
+            # Fetch current actions either from GUI callback or CLI input
+            if action_provider is not None:
+                try:
+                    current_actions = action_provider(mode)
+                except Exception:
+                    current_actions = get_current_action(mode=mode)
+            else:
+                current_actions = get_current_action(mode=mode)
             new_act, conditional_dict = cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, replace=current_actions, mode=mode)
             # Step 3.1: Spatial denoising loop
 
@@ -650,6 +660,12 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             video = rearrange(video, "B T C H W -> B T H W C")
             video = ((video.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)[0]
             video = np.ascontiguousarray(video)
+            # Live preview callback (latest frame of this chunk)
+            if on_frame is not None and video.shape[0] > 0:
+                try:
+                    on_frame(video[-1])
+                except Exception:
+                    pass
             mouse_icon = 'assets/images/mouse.png'
             if mode != 'templerun':
                 config = (
@@ -663,8 +679,9 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             process_video(video.astype(np.uint8), output_folder+f'/{name}_current.mp4', config, mouse_icon, mouse_scale=0.1, process_icon=False, mode=mode)
             current_start_frame += current_num_frames
 
-            if input("Continue? (Press `n` to break)").strip() == "n":
-                break
+            if interactive:
+                if input("Continue? (Press `n` to break)").strip() == "n":
+                    break
                 
         videos_tensor = torch.cat(videos, dim=1)
         videos = rearrange(videos_tensor, "B T C H W -> B T H W C")

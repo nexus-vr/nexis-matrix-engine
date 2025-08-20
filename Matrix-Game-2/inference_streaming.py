@@ -5,6 +5,7 @@ import numpy as np
 import copy
 
 from omegaconf import OmegaConf
+import cv2
 from torchvision.transforms import v2
 from diffusers.utils import load_image
 
@@ -136,6 +137,12 @@ class InteractiveGameInference:
         keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
         conditional_dict['keyboard_cond'] = keyboard_condition
         
+        # Live preview callback for per-frame display (expects RGB uint8 HxWx3)
+        def live_preview(frame_rgb: np.ndarray) -> None:
+            frame_bgr = frame_rgb[:, :, ::-1]
+            cv2.imshow("Matrix-Game Live", frame_bgr)
+            cv2.waitKey(1)
+
         with torch.no_grad():
             videos = self.pipeline.inference(
                 noise=sampled_noise,
@@ -143,7 +150,8 @@ class InteractiveGameInference:
                 return_latents=False,
                 output_folder=self.args.output_folder,
                 name=os.path.basename(img_path),
-                mode=mode
+                mode=mode,
+                on_frame=live_preview,
             )
         
 def main():

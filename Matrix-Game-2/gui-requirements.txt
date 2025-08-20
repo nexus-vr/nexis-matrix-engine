@@ -1,0 +1,4 @@
+# Minimal deps to develop and run the Qt GUI (without ML stack)
+PySide6>=6.6
+numpy>=1.24
+requests>=2.31.0
