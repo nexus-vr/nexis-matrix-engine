@@ -12,7 +12,7 @@ class GenerationWorker(QtCore.QObject):
     finished = QtCore.Signal()
 
     def __init__(self, config_path: str, checkpoint_path: str, pretrained_model_path: str, mode: str,
-                 seed: int = 42, max_num_output_frames: int = 360, device: str = "auto",
+                 seed: int = 42, max_num_output_frames: int = 120, device: str = "auto",
                  actions_provider=None, image_path: str = ""):
         super().__init__()
         self.config_path = config_path
@@ -77,17 +77,26 @@ class GenerationWorker(QtCore.QObject):
             from demo_utils.vae_block3 import VAEDecoderWrapper
             from pipeline import CausalInferenceStreamingPipeline
             from wan.vae.wanx_vae import get_wanx_vae_wrapper
+            import traceback
+            import sys
+            import time
 
+            def log(msg: str):
+                ts = time.strftime('%H:%M:%S')
+                self.status.emit(msg)
+                print(f"[{ts}] [GUI] {msg}", flush=True)
+
+            log("Selecting device…")
             # Auto-select device, fallback to CPU if CUDA not available
             dev_str = self.device_str
             if dev_str == "auto":
                 dev_str = "cuda" if torch.cuda.is_available() else "cpu"
             elif dev_str == "cuda" and not torch.cuda.is_available():
-                self.status.emit("CUDA not available, falling back to CPU")
+                log("CUDA not available, falling back to CPU")
                 dev_str = "cpu"
             device = torch.device(dev_str)
-            # Use bfloat16 on CUDA, float32 on CPU for compatibility
-            weight_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+            # Use float16 on CUDA (safer with many kernels), float32 on CPU
+            weight_dtype = torch.float16 if device.type == "cuda" else torch.float32
 
             frame_process = v2.Compose([
                 v2.Resize(size=(352, 640), antialias=True),
@@ -95,11 +104,16 @@ class GenerationWorker(QtCore.QObject):
                 v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
+            log(f"Seed={self.seed}; loading config: {self.config_path}")
             set_seed(self.seed)
+            t0 = time.perf_counter()
             config = OmegaConf.load(self.config_path)
+            log(f"Config loaded in {time.perf_counter()-t0:.2f}s")
+            log("Initializing generator…")
             generator = WanDiffusionWrapper(**getattr(config, "model_kwargs", {}), is_causal=True)
 
             # VAE decoder
+            log("Loading VAE decoder weights…")
             current_vae_decoder = VAEDecoderWrapper()
             vae_state_dict = torch.load(os.path.join(self.pretrained_model_path, "Wan2.1_VAE.pth"), map_location="cpu")
             decoder_state_dict = {}
@@ -107,29 +121,36 @@ class GenerationWorker(QtCore.QObject):
                 if 'decoder.' in key or 'conv2' in key:
                     decoder_state_dict[key] = value
             current_vae_decoder.load_state_dict(decoder_state_dict)
+            log("Moving VAE decoder to device…")
             current_vae_decoder.to(device, torch.float16 if device.type == "cuda" else torch.float32)
             current_vae_decoder.requires_grad_(False)
             current_vae_decoder.eval()
+            log("Compiling VAE decoder…")
             current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
 
+            log("Building pipeline…")
             pipeline = CausalInferenceStreamingPipeline(config, generator=generator, vae_decoder=current_vae_decoder)
             if self.checkpoint_path:
-                self.status.emit("Loading Pretrained Model...")
+                log("Loading pretrained diffusion checkpoint…")
                 state_dict = load_file(self.checkpoint_path)
                 pipeline.generator.load_state_dict(state_dict)
 
+            log("Moving pipeline to device…")
             pipeline = pipeline.to(device=device, dtype=weight_dtype)
             pipeline.vae_decoder.to(torch.float16 if device.type == "cuda" else torch.float32)
 
             # VAE encoder for image conditioning
+            log("Initializing VAE encoder…")
             from wan.vae.wanx_vae import get_wanx_vae_wrapper
             vae = get_wanx_vae_wrapper(self.pretrained_model_path, torch.float16 if device.type == "cuda" else torch.float32)
             vae.requires_grad_(False)
             vae.eval()
+            log("Moving VAE encoder to device…")
             vae = vae.to(device, weight_dtype)
 
             # Load image (path or URL)
             img_path = self.image_path
+            log(f"Loading image: {img_path}")
             if img_path.startswith('http://') or img_path.startswith('https://'):
                 resp = requests.get(img_path, timeout=20)
                 resp.raise_for_status()
@@ -139,18 +160,25 @@ class GenerationWorker(QtCore.QObject):
             else:
                 image = load_image(img_path.strip())
 
+            log("Preprocessing image…")
             image = self._resizecrop(image, 352, 640)
             image = frame_process(image)[None, :, None, :, :].to(dtype=weight_dtype, device=device)
 
             # Encode the input image as the first latent
+            log("Preparing conditioning latents…")
             padding_video = torch.zeros_like(image).repeat(1, 1, 4 * (self.max_num_output_frames - 1), 1, 1)
             img_cond = torch.concat([image, padding_video], dim=2)
             tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+            log("Encoding image with VAE…")
+            t0 = time.perf_counter()
             img_cond = vae.encode(img_cond, device=device, **tiler_kwargs).to(device)
+            log(f"VAE encode done in {time.perf_counter()-t0:.2f}s")
             mask_cond = torch.ones_like(img_cond)
             mask_cond[:, :, 1:] = 0
             cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
+            log("Encoding visual context…")
             visual_context = vae.clip.encode_video(image)
+            log("Sampling initial noise…")
             sampled_noise = torch.randn([1, 16, self.max_num_output_frames, 44, 80], device=device, dtype=weight_dtype)
 
             conditional_dict = {
@@ -189,6 +217,8 @@ class GenerationWorker(QtCore.QObject):
                 return out
 
             # Run streaming inference without CLI prompts
+            log("Starting pipeline.inference()…")
+            t0 = time.perf_counter()
             pipeline.inference(
                 noise=sampled_noise,
                 conditional_dict=conditional_dict,
@@ -200,9 +230,21 @@ class GenerationWorker(QtCore.QObject):
                 action_provider=action_provider_wrapped,
                 interactive=False,
             )
+            log(f"pipeline.inference() finished in {time.perf_counter()-t0:.2f}s")
 
+        except torch.cuda.OutOfMemoryError as e:
+            msg = "CUDA OOM: reduce MATRIX_MAX_FRAMES or switch MATRIX_DEVICE=cpu"
+            self.status.emit(msg)
+            print(msg, file=sys.stderr)
+            tb = traceback.format_exc()
+            print(tb, file=sys.stderr)
+            self._had_error = True
         except Exception as e:
+            tb = traceback.format_exc()
+            # Emit full error to status and print to console for debugging
             self.status.emit(f"Error: {e}")
+            print(tb, file=sys.stderr)
+            self._had_error = True
         finally:
             self.finished.emit()
 
@@ -238,10 +280,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_action = {"mouse": None, "keyboard": None}
         self.worker_thread = None
         self.worker = None
-        self.max_num_output_frames = 360
+        # Allow overriding frames via env var without code edits
+        try:
+            self.max_num_output_frames = int(os.environ.get("MATRIX_MAX_FRAMES", "120"))
+        except Exception:
+            self.max_num_output_frames = 120
         self.seed_value = 42
         self.pretrained_model_path = "pretrained_model"
         self._last_frame_buf = None  # keep ref to frame memory to avoid GC with QImage
+        self._had_error = False
 
         # True fullscreen by default for immersive grid
         self.showFullScreen()
@@ -440,7 +487,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        self._had_error = False
         self.worker_thread = QtCore.QThread()
+        # Allow overriding device via env var (auto|cuda|cpu)
+        device_env = os.environ.get("MATRIX_DEVICE", "auto").lower()
+        if device_env not in ("auto", "cuda", "cpu"):
+            device_env = "auto"
+
         self.worker = GenerationWorker(
             config_path=config_path,
             checkpoint_path=checkpoint_path,
@@ -448,7 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mode=self.running_mode,
             seed=self.seed_value,
             max_num_output_frames=self.max_num_output_frames,
-            device="auto",
+            device=device_env,
             actions_provider=self.actions_provider,
             image_path=image_path,
         )
@@ -473,13 +526,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker_thread.wait()
         self.worker_thread = None
         self.worker = None
-        self.stack.setCurrentWidget(self.gallery)
-        self.on_status("Idle — Select an image")
+        # Stay on viewer; allow user to go back with Backspace. Show status.
+        if self._had_error:
+            self.on_status("Run ended with error. Press Backspace to return to gallery.")
+        else:
+            self.on_status("Run finished. Press Backspace to return to gallery.")
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         key = event.key()
         if key == QtCore.Qt.Key_Escape:
             self.stop_generation()
+        elif key == QtCore.Qt.Key_Backspace and self.worker_thread is None:
+            self.stack.setCurrentWidget(self.gallery)
+            self.on_status("Idle — Select an image")
         elif self.stack.currentWidget() is self.viewer:
             if key == QtCore.Qt.Key_W:
                 self.set_action('w')
