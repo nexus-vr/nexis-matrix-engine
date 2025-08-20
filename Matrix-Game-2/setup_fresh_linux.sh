@@ -150,11 +150,15 @@ if torch.cuda.is_available():
     print('device:', torch.cuda.get_device_name(0))
 PY
 
+eval "$($HOME/miniconda/bin/conda shell.bash hook)"
+conda activate "$ENV_NAME"
+python gui_app.py
+
 log "Setup complete. Suggested next steps:"
-echo "  1) cd $PROJECT_DIR"
-echo "  2) conda activate $ENV_NAME"
-echo "  3) python inference.py --config_path configs/inference_yaml/inference_universal.yaml \\
-         --checkpoint_path pretrained_model/<checkpoint>.safetensors \\
-         --pretrained_model_path pretrained_model \\
-         --img_path demo_images/universal/0000.png \\
-         --output_folder outputs --seed 42"
+# echo "  1) cd $PROJECT_DIR"
+# echo "  2) conda activate $ENV_NAME"
+# echo "  3) python inference.py --config_path configs/inference_yaml/inference_universal.yaml \\
+#          --checkpoint_path pretrained_model/<checkpoint>.safetensors \\
+#          --pretrained_model_path pretrained_model \\
+#          --img_path demo_images/universal/0000.png \\
+#          --output_folder outputs --seed 42"

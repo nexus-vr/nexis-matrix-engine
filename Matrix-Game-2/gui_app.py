@@ -12,7 +12,7 @@ class GenerationWorker(QtCore.QObject):
     finished = QtCore.Signal()
 
     def __init__(self, config_path: str, checkpoint_path: str, pretrained_model_path: str, mode: str,
-                 seed: int = 42, max_num_output_frames: int = 120, device: str = "auto",
+                 seed: int = 42, max_num_output_frames: int = 360, device: str = "auto",
                  actions_provider=None, image_path: str = ""):
         super().__init__()
         self.config_path = config_path
@@ -95,8 +95,8 @@ class GenerationWorker(QtCore.QObject):
                 log("CUDA not available, falling back to CPU")
                 dev_str = "cpu"
             device = torch.device(dev_str)
-            # Use float16 on CUDA (safer with many kernels), float32 on CPU
-            weight_dtype = torch.float16 if device.type == "cuda" else torch.float32
+            # Match original script: use bfloat16 on CUDA, float32 on CPU
+            weight_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
             frame_process = v2.Compose([
                 v2.Resize(size=(352, 640), antialias=True),
@@ -282,16 +282,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = None
         # Allow overriding frames via env var without code edits
         try:
-            self.max_num_output_frames = int(os.environ.get("MATRIX_MAX_FRAMES", "120"))
+            self.max_num_output_frames = int(os.environ.get("MATRIX_MAX_FRAMES", "360"))
         except Exception:
-            self.max_num_output_frames = 120
+            self.max_num_output_frames = 360
         self.seed_value = 42
         self.pretrained_model_path = "pretrained_model"
         self._last_frame_buf = None  # keep ref to frame memory to avoid GC with QImage
         self._had_error = False
 
-        # True fullscreen by default for immersive grid
-        self.showFullScreen()
+        # Do not force fullscreen. Opt-in via env var if desired.
+        if os.environ.get("MATRIX_FULLSCREEN", "0") == "1":
+            self.showFullScreen()
 
     def set_action(self, key: str):
         mode = self.running_mode
