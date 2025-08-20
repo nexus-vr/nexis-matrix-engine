@@ -41,19 +41,33 @@ fi
 
 # 2) Miniconda install (local, no sudo)
 if ! need_cmd conda; then
-  log "Installing Miniconda to $CONDA_DIR"
+  if [ -d "$CONDA_DIR" ]; then
+    warn "Miniconda directory exists at $CONDA_DIR but 'conda' not in PATH. Attempting upgrade install (-u)."
+  else
+    log "Installing Miniconda to $CONDA_DIR"
+  fi
   mkdir -p "$HOME"
   cd "$HOME"
   curl -fsSL -o Miniconda3.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-  bash Miniconda3.sh -b -p "$CONDA_DIR"
+  if [ -d "$CONDA_DIR" ]; then
+    bash Miniconda3.sh -u -b -p "$CONDA_DIR" || true
+  else
+    bash Miniconda3.sh -b -p "$CONDA_DIR"
+  fi
   rm -f Miniconda3.sh
 else
   log "Conda already present: $(conda --version || true)"
 fi
 
-# 3) Initialize conda for this shell
+# 3) Initialize conda for this shell (with fallback)
 log "Initializing conda in current shell"
-eval "$($CONDA_DIR/bin/conda shell.bash hook)"
+if [ -x "$CONDA_DIR/bin/conda" ]; then
+  eval "$($CONDA_DIR/bin/conda shell.bash hook)" || true
+fi
+if ! need_cmd conda && [ -x "$CONDA_DIR/bin/conda" ]; then
+  warn "'conda' still not on PATH; using absolute path for subsequent conda commands."
+  alias conda="$CONDA_DIR/bin/conda"
+fi
 
 # 4) Accept ToS for default channels (handles non-interactive hosts)
 log "Accepting Conda Terms of Service for Anaconda channels (if required)"
@@ -94,6 +108,14 @@ fi
 log "Installing project requirements"
 pip install -U pip
 pip install -r "$PROJECT_DIR/requirements.txt"
+
+# 7b) GUI requirements (optional)
+if [ -f "$PROJECT_DIR/gui-requirements.txt" ]; then
+  log "Installing GUI requirements (gui-requirements.txt)"
+  pip install -r "$PROJECT_DIR/gui-requirements.txt"
+else
+  warn "gui-requirements.txt not found; skipping GUI deps"
+fi
 
 # 8) Extra performance libs (best-effort)
 log "Installing Flash-Attn (best-effort)"

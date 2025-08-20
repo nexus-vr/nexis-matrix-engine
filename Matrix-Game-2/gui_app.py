@@ -12,7 +12,7 @@ class GenerationWorker(QtCore.QObject):
     finished = QtCore.Signal()
 
     def __init__(self, config_path: str, checkpoint_path: str, pretrained_model_path: str, mode: str,
-                 seed: int = 42, max_num_output_frames: int = 360, device: str = "cuda",
+                 seed: int = 42, max_num_output_frames: int = 360, device: str = "auto",
                  actions_provider=None, image_path: str = ""):
         super().__init__()
         self.config_path = config_path
@@ -78,8 +78,16 @@ class GenerationWorker(QtCore.QObject):
             from pipeline import CausalInferenceStreamingPipeline
             from wan.vae.wanx_vae import get_wanx_vae_wrapper
 
-            device = torch.device(self.device_str)
-            weight_dtype = torch.bfloat16
+            # Auto-select device, fallback to CPU if CUDA not available
+            dev_str = self.device_str
+            if dev_str == "auto":
+                dev_str = "cuda" if torch.cuda.is_available() else "cpu"
+            elif dev_str == "cuda" and not torch.cuda.is_available():
+                self.status.emit("CUDA not available, falling back to CPU")
+                dev_str = "cpu"
+            device = torch.device(dev_str)
+            # Use bfloat16 on CUDA, float32 on CPU for compatibility
+            weight_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
             frame_process = v2.Compose([
                 v2.Resize(size=(352, 640), antialias=True),
@@ -99,7 +107,7 @@ class GenerationWorker(QtCore.QObject):
                 if 'decoder.' in key or 'conv2' in key:
                     decoder_state_dict[key] = value
             current_vae_decoder.load_state_dict(decoder_state_dict)
-            current_vae_decoder.to(device, torch.float16)
+            current_vae_decoder.to(device, torch.float16 if device.type == "cuda" else torch.float32)
             current_vae_decoder.requires_grad_(False)
             current_vae_decoder.eval()
             current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
@@ -111,11 +119,11 @@ class GenerationWorker(QtCore.QObject):
                 pipeline.generator.load_state_dict(state_dict)
 
             pipeline = pipeline.to(device=device, dtype=weight_dtype)
-            pipeline.vae_decoder.to(torch.float16)
+            pipeline.vae_decoder.to(torch.float16 if device.type == "cuda" else torch.float32)
 
             # VAE encoder for image conditioning
             from wan.vae.wanx_vae import get_wanx_vae_wrapper
-            vae = get_wanx_vae_wrapper(self.pretrained_model_path, torch.float16)
+            vae = get_wanx_vae_wrapper(self.pretrained_model_path, torch.float16 if device.type == "cuda" else torch.float32)
             vae.requires_grad_(False)
             vae.eval()
             vae = vae.to(device, weight_dtype)
@@ -233,6 +241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_num_output_frames = 360
         self.seed_value = 42
         self.pretrained_model_path = "pretrained_model"
+        self._last_frame_buf = None  # keep ref to frame memory to avoid GC with QImage
 
         # True fullscreen by default for immersive grid
         self.showFullScreen()
@@ -264,8 +273,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(np.ndarray)
     def on_frame(self, frame_rgb: np.ndarray):
-        h, w, _ = frame_rgb.shape
-        qimg = QtGui.QImage(frame_rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+        # Keep a contiguous copy to ensure QImage data stays valid
+        self._last_frame_buf = np.ascontiguousarray(frame_rgb)
+        h, w, _ = self._last_frame_buf.shape
+        qimg = QtGui.QImage(self._last_frame_buf.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg)
         self.viewer.setPixmap(pix.scaled(self.viewer.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
 
@@ -420,8 +431,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_status(f"Missing checkpoint: {checkpoint_path}")
             return
 
-        # Switch to viewer page
+        # Switch to viewer page and show the clicked image immediately as a placeholder
         self.stack.setCurrentWidget(self.viewer)
+        try:
+            preview_pix = QtGui.QPixmap(image_path)
+            if not preview_pix.isNull():
+                self.viewer.setPixmap(preview_pix.scaled(self.viewer.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        except Exception:
+            pass
 
         self.worker_thread = QtCore.QThread()
         self.worker = GenerationWorker(
@@ -431,7 +448,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mode=self.running_mode,
             seed=self.seed_value,
             max_num_output_frames=self.max_num_output_frames,
-            device="cuda",
+            device="auto",
             actions_provider=self.actions_provider,
             image_path=image_path,
         )
